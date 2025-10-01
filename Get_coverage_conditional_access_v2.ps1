@@ -7,6 +7,7 @@
       - Include/Exclude: Users, Groups (transitive), Directory Roles (transitive)
       - Include/Exclude Guests or External Users
       - Includes ALL policies (Enabled, Report-only, Disabled)
+      - Identifies mailbox type (User, Shared, Room, Equipment, or N/A)
     It does NOT simulate sign-in-time conditions (device, platform, location, app, risk, auth context).
     Output is a detailed CSV showing exactly which policies are enforced for each user.
 
@@ -16,7 +17,10 @@
       * Microsoft.Graph.Authentication
       * Microsoft.Graph.Users
       * Microsoft.Graph.Identity.SignIns
+    - Exchange Online PowerShell Module (optional, for mailbox type detection)
+      * ExchangeOnlineManagement
     - Permissions: Policy.Read.All, Directory.Read.All (RoleManagement.Read.Directory recommended)
+    - Exchange Permissions: View-Only Recipients or Exchange Administrator (if checking mailbox types)
 
 .PARAMETER OutputPath
     CSV output file path. Defaults to ".\CA_Coverage_<timestamp>.csv"
@@ -35,20 +39,21 @@
 .PARAMETER EmitMatrix
     If set, also emits a wide user x policy matrix CSV (may be large in big tenants).
 
-.PARAMETER UseBeta
-    [DEPRECATED] This parameter is no longer needed as the script automatically uses the appropriate API version.
-
 .PARAMETER ShowPolicyDetails
     Include detailed policy information (controls, conditions) in the output.
+
+.PARAMETER CheckMailboxType
+    If set, connects to Exchange Online and checks mailbox type for each user.
+    This will significantly increase runtime for large user sets.
 
 .EXAMPLE
     .\Get-EntraCAPolicyCoverage.ps1
 
 .EXAMPLE
-    .\Get-EntraCAPolicyCoverage.ps1 -UserTypes Member -ExcludeUserFilterScriptBlock { param($u) $u.userPrincipalName -like "svc_*" }
+    .\Get-EntraCAPolicyCoverage.ps1 -UserTypes Member -CheckMailboxType
 
 .EXAMPLE
-    .\Get-EntraCAPolicyCoverage.ps1 -OnlyEnabledUsers -EmitMatrix -ShowPolicyDetails
+    .\Get-EntraCAPolicyCoverage.ps1 -OnlyEnabledUsers -EmitMatrix -ShowPolicyDetails -CheckMailboxType
 #>
 
 [CmdletBinding()]
@@ -66,12 +71,17 @@ param(
 
     [switch]$UseBeta, # Deprecated - kept for compatibility
 
-    [switch]$ShowPolicyDetails
+    [switch]$ShowPolicyDetails,
+
+    [switch]$CheckMailboxType
 )
 
 # Optional: Clear any previously loaded (meta) Graph modules to avoid function overflow
 Remove-Module Microsoft.Graph -Force -ErrorAction SilentlyContinue
 Remove-Module Microsoft.Graph.* -Force -ErrorAction SilentlyContinue
+
+# Determine mailbox checking method (set default to Graph API)
+$script:UseGraphForMailbox = $true
 
 # --------------------------
 # Helper: Ensure minimal Graph submodules
@@ -111,6 +121,340 @@ function Ensure-GraphSubmodules {
     }
     
     Write-Host "All required Graph modules loaded successfully." -ForegroundColor Green
+}
+
+# --------------------------
+# Helper: Ensure Exchange Online module
+# --------------------------
+function Ensure-ExchangeOnlineModule {
+    if (-not $CheckMailboxType) { return }
+    
+    Write-Host "Checking Exchange Online PowerShell module..." -ForegroundColor Cyan
+    
+    $exoModule = Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $exoModule) {
+        Write-Host "ExchangeOnlineManagement module not found. Installing for current user..." -ForegroundColor Yellow
+        try {
+            Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force -ErrorAction Stop
+            Write-Host "Successfully installed ExchangeOnlineManagement" -ForegroundColor Green
+        } catch {
+            Write-Warning "Failed to install ExchangeOnlineManagement. Mailbox type checking will be skipped. $_"
+            $script:CheckMailboxType = $false
+            return
+        }
+    } else {
+        Write-Host "Found ExchangeOnlineManagement version $($exoModule.Version)" -ForegroundColor Green
+    }
+    
+    try {
+        Import-Module ExchangeOnlineManagement -ErrorAction Stop
+        Write-Host "ExchangeOnlineManagement module loaded successfully." -ForegroundColor Green
+    } catch {
+        Write-Warning "Failed to import ExchangeOnlineManagement. Mailbox type checking will be skipped. $_"
+        $script:CheckMailboxType = $false
+    }
+}
+
+# --------------------------
+# Helper: Connect to Exchange Online
+# --------------------------
+function Connect-ExchangeOnlineIfNeeded {
+    if (-not $CheckMailboxType) { 
+        Write-Verbose "CheckMailboxType is false, skipping Exchange Online connection"
+        return 
+    }
+    
+    try {
+        Write-Host "Checking Exchange Online connection status..." -ForegroundColor Cyan
+        
+        # Check if already connected
+        $existingSession = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($existingSession) {
+            Write-Host "Already connected to Exchange Online:" -ForegroundColor Green
+            Write-Host "  Organization: $($existingSession.Organization)" -ForegroundColor Cyan
+            Write-Host "  User: $($existingSession.UserPrincipalName)" -ForegroundColor Cyan
+            
+            # Test the connection with a simple command
+            try {
+                $testMailbox = Get-EXOMailbox -ResultSize 1 -ErrorAction Stop
+                Write-Host "  Connection test: SUCCESS" -ForegroundColor Green
+                return $true
+            } catch {
+                Write-Warning "Existing connection appears stale. Reconnecting..."
+                Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+            }
+        }
+        
+        Write-Host "Connecting to Exchange Online..." -ForegroundColor Cyan
+        Write-Host "NOTE: You will be prompted for credentials if not already authenticated." -ForegroundColor Yellow
+        Write-Host "Please sign in with an account that has Exchange Administrator or View-Only Recipients permissions." -ForegroundColor Yellow
+        
+        # Try to connect with InlineCredential to avoid WAM (Web Account Manager) issues
+        # This fixes the "window handle must be configured" error
+        try {
+            Connect-ExchangeOnline -ShowBanner:$false -InlineCredential -ErrorAction Stop
+        } catch {
+            # If InlineCredential fails, try without it (for older module versions)
+            Write-Verbose "InlineCredential failed, trying standard authentication..."
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+        
+        # Verify connection worked
+        $connectionInfo = Get-ConnectionInformation -ErrorAction Stop
+        Write-Host "Successfully connected to Exchange Online!" -ForegroundColor Green
+        Write-Host "  Organization: $($connectionInfo.Organization)" -ForegroundColor Cyan
+        Write-Host "  User: $($connectionInfo.UserPrincipalName)" -ForegroundColor Cyan
+        
+        # Final test
+        $testMailbox = Get-EXOMailbox -ResultSize 1 -ErrorAction Stop
+        Write-Host "  Connection verified with test query." -ForegroundColor Green
+        
+        return $true
+        
+    } catch {
+        Write-Host ""
+        Write-Error "Failed to connect to Exchange Online!"
+        Write-Host "Error details: $_" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "Troubleshooting steps:" -ForegroundColor Yellow
+        Write-Host "1. Ensure you have the ExchangeOnlineManagement module installed" -ForegroundColor Yellow
+        Write-Host "2. Verify you have Exchange Administrator or View-Only Recipients permissions" -ForegroundColor Yellow
+        Write-Host "3. Try running: Connect-ExchangeOnline manually first" -ForegroundColor Yellow
+        Write-Host "4. Check if MFA is required for your account" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "Mailbox type checking will be DISABLED for this run." -ForegroundColor Red
+        Write-Host "The script will continue but AccountType and MailboxType columns will show 'Not Checked'." -ForegroundColor Yellow
+        Write-Host ""
+        
+        $script:CheckMailboxType = $false
+        return $false
+    }
+}
+
+# --------------------------
+# Helper: Get mailbox type for a user
+# --------------------------
+function Get-UserMailboxType {
+    param([Parameter(Mandatory=$true)][string]$UserPrincipalName)
+    
+    if (-not $CheckMailboxType) { return "Not Checked" }
+    
+    try {
+        $mailbox = Get-EXOMailbox -Identity $UserPrincipalName -ErrorAction SilentlyContinue -Properties RecipientTypeDetails
+        
+        if ($mailbox) {
+            return $mailbox.RecipientTypeDetails
+        } else {
+            # No mailbox found - might be cloud-only account without mailbox
+            return "No Mailbox"
+        }
+    } catch {
+        # Handle various error scenarios
+        if ($_.Exception.Message -like "*couldn't be found*" -or $_.Exception.Message -like "*not found*") {
+            return "No Mailbox"
+        } else {
+            Write-Verbose "Error checking mailbox for $UserPrincipalName : $_"
+            return "Error"
+        }
+    }
+}
+
+# --------------------------
+# Helper: Get mailbox type using Microsoft Graph
+# --------------------------
+function Get-MailboxTypeViaGraph {
+    param([Parameter(Mandatory=$true)][string]$UserId)
+    
+    try {
+        # Query user's mailbox settings via Graph
+        $uri = "https://graph.microsoft.com/v1.0/users/$UserId/mailboxSettings"
+        $result = Invoke-MgGraphRequest -Uri $uri -Method GET -ErrorAction Stop
+        
+        # If we get a response, the user has a mailbox
+        # We need additional properties to determine if it's shared
+        $userDetails = Get-MgUser -UserId $UserId -Property "assignedLicenses,userType" -ErrorAction SilentlyContinue
+        
+        # Check if user has any licenses (shared mailboxes typically don't)
+        if ($userDetails.AssignedLicenses.Count -eq 0) {
+            return "SharedMailbox"  # Likely a shared mailbox
+        } else {
+            return "UserMailbox"
+        }
+    } catch {
+        if ($_.Exception.Message -like "*MailboxNotEnabledForRESTAPI*" -or 
+            $_.Exception.Message -like "*ResourceNotFound*" -or
+            $_.Exception.Message -like "*ErrorItemNotFound*") {
+            return "No Mailbox"
+        } else {
+            Write-Verbose "Error checking mailbox via Graph for user $UserId : $_"
+            return "Unknown"
+        }
+    }
+}
+
+# --------------------------
+# Helper: Batch get mailbox types (more efficient)
+# --------------------------
+function Get-MailboxTypesBatch {
+    param([Parameter(Mandatory=$true)][array]$Users)
+    
+    if (-not $CheckMailboxType -or $Users.Count -eq 0) { 
+        Write-Host "Mailbox type checking is disabled or no users to process." -ForegroundColor Yellow
+        return @{}
+    }
+    
+    # Use Graph API method if selected
+    if ($script:UseGraphForMailbox) {
+        Write-Host "Using Microsoft Graph API to check mailbox types for $($Users.Count) users..." -ForegroundColor Cyan
+        Write-Host "Note: This method may not distinguish all mailbox types as precisely as Exchange Online." -ForegroundColor Yellow
+        
+        $mailboxTypes = @{}
+        $userCount = 0
+        $totalUsers = $Users.Count
+        
+        foreach ($user in $Users) {
+            $userCount++
+            if ($userCount % 10 -eq 0 -or $userCount -eq $totalUsers) {
+                $percentComplete = [Math]::Round(($userCount / $totalUsers) * 100, 1)
+                Write-Progress -Activity "Checking mailbox types via Graph API" -Status "Processing user $userCount of $totalUsers" -PercentComplete $percentComplete
+            }
+            
+            try {
+                # Check assignedLicenses to determine if it's likely a shared mailbox
+                $userWithLicenses = Get-MgUser -UserId $user.Id -Property "assignedLicenses" -ErrorAction Stop
+                
+                if ($userWithLicenses.AssignedLicenses.Count -eq 0 -and $user.Mail) {
+                    # No licenses but has email = likely shared mailbox
+                    $mailboxTypes[$user.UserPrincipalName] = "SharedMailbox"
+                } elseif ($userWithLicenses.AssignedLicenses.Count -gt 0) {
+                    # Has licenses = regular user mailbox
+                    $mailboxTypes[$user.UserPrincipalName] = "UserMailbox"
+                } else {
+                    # No licenses and no mail attribute
+                    $mailboxTypes[$user.UserPrincipalName] = "No Mailbox"
+                }
+            } catch {
+                Write-Verbose "Error checking user $($user.UserPrincipalName): $_"
+                $mailboxTypes[$user.UserPrincipalName] = "Unknown"
+            }
+            
+            # Small delay every 100 users to avoid throttling
+            if ($userCount % 100 -eq 0) {
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        
+        Write-Progress -Activity "Checking mailbox types via Graph API" -Completed
+        
+        # Summary statistics
+        $stats = $mailboxTypes.Values | Group-Object | Sort-Object Name
+        Write-Host ""
+        Write-Host "Mailbox type detection summary (via Graph API):" -ForegroundColor Cyan
+        foreach ($stat in $stats) {
+            Write-Host "  $($stat.Name): $($stat.Count)" -ForegroundColor Cyan
+        }
+        Write-Host "Total processed: $($mailboxTypes.Count) users" -ForegroundColor Green
+        
+        return $mailboxTypes
+    }
+    
+    # Original Exchange Online method
+    Write-Host "Retrieving mailbox information for $($Users.Count) users (this may take a while)..." -ForegroundColor Cyan
+    
+    # First, verify Exchange Online connection
+    try {
+        Write-Host "Testing Exchange Online connection..." -ForegroundColor Cyan
+        $testMailbox = Get-EXOMailbox -ResultSize 1 -ErrorAction Stop
+        Write-Host "Exchange Online connection verified successfully." -ForegroundColor Green
+    } catch {
+        Write-Error "Exchange Online connection test failed: $_"
+        Write-Host "Unable to retrieve mailbox information. All accounts will be marked as 'Connection Failed'." -ForegroundColor Red
+        $failedLookup = @{}
+        foreach ($user in $Users) {
+            $failedLookup[$user.UserPrincipalName] = "Connection Failed"
+        }
+        return $failedLookup
+    }
+    
+    $mailboxTypes = @{}
+    $batchSize = 50  # Reduced batch size for better reliability
+    $batches = [Math]::Ceiling($Users.Count / $batchSize)
+    
+    Write-Host "Processing in $batches batches of up to $batchSize users each..." -ForegroundColor Cyan
+    
+    for ($i = 0; $i -lt $batches; $i++) {
+        $startIdx = $i * $batchSize
+        $endIdx = [Math]::Min(($startIdx + $batchSize - 1), ($Users.Count - 1))
+        $batchUsers = $Users[$startIdx..$endIdx]
+        
+        $percentComplete = [Math]::Round((($i + 1) / $batches) * 100, 1)
+        Write-Progress -Activity "Checking mailbox types" -Status "Processing batch $($i + 1) of $batches ($($batchUsers.Count) users)" -PercentComplete $percentComplete
+        
+        Write-Verbose "Batch $($i + 1): Processing users $startIdx to $endIdx"
+        
+        try {
+            # Try to get all mailboxes with a filter approach
+            $mailboxes = @()
+            foreach ($user in $batchUsers) {
+                try {
+                    $mbx = Get-EXOMailbox -Identity $user.UserPrincipalName -Properties RecipientTypeDetails -ErrorAction Stop
+                    if ($mbx) {
+                        $mailboxes += $mbx
+                        Write-Verbose "Found mailbox for $($user.UserPrincipalName): $($mbx.RecipientTypeDetails)"
+                    }
+                } catch {
+                    if ($_.Exception.Message -like "*couldn't be found*" -or $_.Exception.Message -like "*not found*") {
+                        $mailboxTypes[$user.UserPrincipalName] = "No Mailbox"
+                        Write-Verbose "No mailbox found for $($user.UserPrincipalName)"
+                    } else {
+                        $mailboxTypes[$user.UserPrincipalName] = "Error"
+                        Write-Verbose "Error checking $($user.UserPrincipalName): $_"
+                    }
+                }
+            }
+            
+            # Create lookup dictionary for found mailboxes
+            foreach ($mbx in $mailboxes) {
+                $mailboxTypes[$mbx.UserPrincipalName] = $mbx.RecipientTypeDetails
+            }
+            
+            # Mark any users not yet processed as "No Mailbox"
+            foreach ($user in $batchUsers) {
+                if (-not $mailboxTypes.ContainsKey($user.UserPrincipalName)) {
+                    $mailboxTypes[$user.UserPrincipalName] = "No Mailbox"
+                }
+            }
+            
+            Write-Host "Batch $($i + 1)/$batches complete: Found $($mailboxes.Count) mailboxes out of $($batchUsers.Count) users" -ForegroundColor Green
+            
+        } catch {
+            Write-Warning "Error processing batch $($i + 1): $_"
+            # Mark all users in failed batch as "Error"
+            foreach ($user in $batchUsers) {
+                if (-not $mailboxTypes.ContainsKey($user.UserPrincipalName)) {
+                    $mailboxTypes[$user.UserPrincipalName] = "Batch Error"
+                }
+            }
+        }
+        
+        # Small delay to avoid throttling
+        if ($i -lt ($batches - 1)) {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    
+    Write-Progress -Activity "Checking mailbox types" -Completed
+    
+    # Summary statistics
+    $stats = $mailboxTypes.Values | Group-Object | Sort-Object Name
+    Write-Host ""
+    Write-Host "Mailbox type retrieval summary:" -ForegroundColor Cyan
+    foreach ($stat in $stats) {
+        Write-Host "  $($stat.Name): $($stat.Count)" -ForegroundColor Cyan
+    }
+    Write-Host "Total processed: $($mailboxTypes.Count) users" -ForegroundColor Green
+    
+    return $mailboxTypes
 }
 
 # --------------------------
@@ -449,8 +793,58 @@ function Test-PolicyTargetsUser {
 $ErrorActionPreference = 'Stop'
 Write-Host "Starting Enhanced Conditional Access Policy Coverage Audit..." -ForegroundColor Cyan
 
+# Check mailbox detection method if enabled
+if ($CheckMailboxType) {
+    Write-Host ""
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host "MAILBOX TYPE DETECTION METHOD" -ForegroundColor Cyan
+    Write-Host "========================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Choose how to detect mailbox types:" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  [1] Microsoft Graph API (Recommended)" -ForegroundColor Green
+    Write-Host "      - Uses your existing Graph connection" -ForegroundColor Gray
+    Write-Host "      - No additional authentication needed" -ForegroundColor Gray
+    Write-Host "      - Fast and reliable" -ForegroundColor Gray
+    Write-Host "      - Detects: User Mailbox, Shared Mailbox, No Mailbox" -ForegroundColor Gray
+    Write-Host ""
+    Write-Host "  [2] Exchange Online PowerShell" -ForegroundColor Yellow
+    Write-Host "      - Requires separate Exchange Online connection" -ForegroundColor Gray
+    Write-Host "      - More detailed mailbox type information" -ForegroundColor Gray
+    Write-Host "      - May require additional authentication" -ForegroundColor Gray
+    Write-Host ""
+    
+    $choice = Read-Host "Enter your choice (1 or 2) [Default: 1]"
+    
+    if ([string]::IsNullOrWhiteSpace($choice)) {
+        $choice = "1"
+    }
+    
+    if ($choice -eq "1") {
+        $script:UseGraphForMailbox = $true
+        Write-Host ""
+        Write-Host "✓ Using Microsoft Graph API for mailbox detection" -ForegroundColor Green
+    } elseif ($choice -eq "2") {
+        $script:UseGraphForMailbox = $false
+        Write-Host ""
+        Write-Host "✓ Using Exchange Online PowerShell for mailbox detection" -ForegroundColor Green
+    } else {
+        Write-Host ""
+        Write-Host "Invalid choice. Defaulting to Microsoft Graph API." -ForegroundColor Yellow
+        $script:UseGraphForMailbox = $true
+    }
+    
+    Write-Host ""
+}
+
 Ensure-GraphSubmodules
 Connect-GraphIfNeeded
+
+# Connect to Exchange Online if mailbox checking is enabled
+if ($CheckMailboxType -and -not $script:UseGraphForMailbox) {
+    Ensure-ExchangeOnlineModule
+    Connect-ExchangeOnlineIfNeeded
+}
 
 Write-Host "Retrieving Conditional Access policies..." -ForegroundColor Cyan
 $policies = Get-AllCAPolicies
@@ -489,6 +883,12 @@ if (-not $users) {
 
 Write-Host "Users found: $($users.Count); Policies found: $($policies.Count)" -ForegroundColor Green
 
+# Get mailbox types in batch if enabled
+$mailboxTypeLookup = @{}
+if ($CheckMailboxType) {
+    $mailboxTypeLookup = Get-MailboxTypesBatch -Users $users
+}
+
 # Prepare results
 $results = New-Object System.Collections.Generic.List[object]
 $matrixRows = if ($EmitMatrix) { New-Object System.Collections.Generic.List[object] } else { $null }
@@ -505,6 +905,13 @@ foreach ($user in $users) {
     $idx++
     $progressPercent = [math]::Round(($idx / [math]::Max($total,1)) * 100, 1)
     Write-Progress -Activity "Evaluating CA coverage" -Status "$($user.UserPrincipalName) ($idx of $total)" -PercentComplete $progressPercent
+
+    # Get mailbox type
+    $mailboxType = if ($CheckMailboxType -and $mailboxTypeLookup.ContainsKey($user.UserPrincipalName)) {
+        $mailboxTypeLookup[$user.UserPrincipalName]
+    } else {
+        "Not Checked"
+    }
 
     # Resolve transitive memberships (dynamic groups are auto-resolved by Graph)
     $membership = Get-UserTransitiveMembership -UserId $user.Id
@@ -545,6 +952,7 @@ foreach ($user in $users) {
     # Debug: Log policy information for first few users
     if ($idx -le 3) {
         Write-Host "DEBUG - User: $($user.UserPrincipalName)" -ForegroundColor Magenta
+        Write-Host "  Mailbox Type: $mailboxType" -ForegroundColor Magenta
         Write-Host "  Applied policies: $($appliedPolicies.Count)" -ForegroundColor Magenta
         Write-Host "  Enabled policies: $($enabled.Count)" -ForegroundColor Magenta
         if ($enabled.Count -gt 0) {
@@ -571,12 +979,26 @@ foreach ($user in $users) {
         return "$displayName (State: $state)$controls"
     }
 
+    # Classify account type based on mailbox type
+    $accountType = switch ($mailboxType) {
+        "UserMailbox" { "User" }
+        "SharedMailbox" { "Shared Mailbox" }
+        "RoomMailbox" { "Room Mailbox" }
+        "EquipmentMailbox" { "Equipment Mailbox" }
+        "No Mailbox" { "No Mailbox" }
+        "Not Checked" { "Not Checked" }
+        "Error" { "Error" }
+        default { $mailboxType }
+    }
+
     $result = [PSCustomObject]@{
         UserPrincipalName             = $user.UserPrincipalName
         DisplayName                   = $user.DisplayName
         UserId                        = $user.Id
         UserType                      = $user.UserType
         AccountEnabled                = $user.AccountEnabled
+        AccountType                   = $accountType
+        MailboxType                   = $mailboxType
         Mail                          = if ($user.Mail) { $user.Mail } else { "" }
         Department                    = if ($user.Department) { $user.Department } else { "" }
         JobTitle                      = if ($user.JobTitle) { $user.JobTitle } else { "" }
@@ -632,6 +1054,8 @@ foreach ($user in $users) {
             DisplayName       = $user.DisplayName
             UserId            = $user.Id
             UserType          = $user.UserType
+            AccountType       = $accountType
+            MailboxType       = $mailboxType
         }
         $appliedPolicyStates = @{}
         foreach ($p in $appliedPolicies) { 
@@ -668,6 +1092,12 @@ $notCoveredEnabled = @($results | Where-Object { -not $_.HasEnforcedPolicy })
 $highRiskUsers = @($results | Where-Object { $_.RiskLevel -like "HIGH*" })
 $mediumRiskUsers = @($results | Where-Object { $_.RiskLevel -like "MEDIUM*" })
 
+# Mailbox type statistics
+if ($CheckMailboxType) {
+    $mailboxStats = $results | Group-Object AccountType | Sort-Object Name
+    $sharedMailboxes = @($results | Where-Object { $_.AccountType -eq "Shared Mailbox" })
+}
+
 Write-Host ""
 Write-Host "========== ENHANCED SUMMARY ==========" -ForegroundColor Green
 Write-Host ("Total Users Evaluated:           {0}" -f $results.Count)
@@ -676,11 +1106,41 @@ Write-Host ("Users with NO enforced policies: {0}" -f $notCoveredEnabled.Count) 
 Write-Host ("High Risk Users:                 {0}" -f $highRiskUsers.Count) -ForegroundColor $(if ($highRiskUsers.Count -gt 0) { "Red" } else { "Green" })
 Write-Host ("Medium Risk Users:               {0}" -f $mediumRiskUsers.Count) -ForegroundColor $(if ($mediumRiskUsers.Count -gt 0) { "Yellow" } else { "Green" })
 
+if ($CheckMailboxType) {
+    Write-Host ""
+    Write-Host "ACCOUNT TYPE DISTRIBUTION:" -ForegroundColor Cyan
+    foreach ($stat in $mailboxStats) {
+        $color = switch ($stat.Name) {
+            'Shared Mailbox' { 'Yellow' }
+            'User' { 'Green' }
+            'Room Mailbox' { 'Cyan' }
+            'Equipment Mailbox' { 'Cyan' }
+            'No Mailbox' { 'Gray' }
+            default { 'White' }
+        }
+        Write-Host ("  {0}: {1}" -f $stat.Name, $stat.Count) -ForegroundColor $color
+    }
+    
+    if ($sharedMailboxes.Count -gt 0) {
+        Write-Host ""
+        Write-Host "SHARED MAILBOXES:" -ForegroundColor Yellow
+        $sharedMailboxes | Select-Object -First 10 | ForEach-Object {
+            $policyStatus = if ($_.HasEnforcedPolicy) { "Protected" } else { "NOT Protected" }
+            $color = if ($_.HasEnforcedPolicy) { "Green" } else { "Red" }
+            Write-Host ("  - {0} ({1}) - {2}" -f $_.UserPrincipalName, $_.DisplayName, $policyStatus) -ForegroundColor $color
+        }
+        if ($sharedMailboxes.Count -gt 10) {
+            Write-Host "  ... and $($sharedMailboxes.Count - 10) more" -ForegroundColor Yellow
+        }
+    }
+}
+
 if ($highRiskUsers.Count -gt 0) {
     Write-Host ""
     Write-Host "HIGH RISK USERS (No enforced CA policies):" -ForegroundColor Red
     $highRiskUsers | Select-Object -First 10 | ForEach-Object { 
-        Write-Host "  - $($_.UserPrincipalName) ($($_.DisplayName))" -ForegroundColor Red 
+        $accountInfo = if ($CheckMailboxType) { " [$($_.AccountType)]" } else { "" }
+        Write-Host "  - $($_.UserPrincipalName) ($($_.DisplayName))$accountInfo" -ForegroundColor Red 
     }
     if ($highRiskUsers.Count -gt 10) {
         Write-Host "  ... and $($highRiskUsers.Count - 10) more" -ForegroundColor Red
@@ -691,7 +1151,8 @@ if ($mediumRiskUsers.Count -gt 0) {
     Write-Host ""
     Write-Host "MEDIUM RISK USERS (Limited CA policy coverage):" -ForegroundColor Yellow
     $mediumRiskUsers | Select-Object -First 5 | ForEach-Object { 
-        Write-Host "  - $($_.UserPrincipalName) ($($_.DisplayName)) - $($_.AppliedPolicyCount_Enabled) enforced policies" -ForegroundColor Yellow 
+        $accountInfo = if ($CheckMailboxType) { " [$($_.AccountType)]" } else { "" }
+        Write-Host "  - $($_.UserPrincipalName) ($($_.DisplayName))$accountInfo - $($_.AppliedPolicyCount_Enabled) enforced policies" -ForegroundColor Yellow 
     }
 }
 
@@ -715,6 +1176,21 @@ Write-Host "  Main Report: $OutputPath" -ForegroundColor Green
 if ($EmitMatrix) {
     Write-Host "  Matrix Report: $([System.IO.Path]::ChangeExtension($OutputPath, $null))_MATRIX.csv" -ForegroundColor Green
 }
-
+A
 Write-Host "=====================================" -ForegroundColor Green
 Write-Host "Enhanced CA Policy Coverage Audit Complete!" -ForegroundColor Green
+
+# Cleanup Exchange Online connection if we connected
+if ($CheckMailboxType -and -not $script:UseGraphForMailbox) {
+    try {
+        $existingSession = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($existingSession) {
+            Write-Host ""
+            Write-Host "Disconnecting from Exchange Online..." -ForegroundColor Cyan
+            Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+            Write-Host "Disconnected from Exchange Online." -ForegroundColor Green
+        }
+    } catch {
+        # Silently ignore cleanup errors
+    }
+}
