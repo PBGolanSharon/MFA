@@ -1066,8 +1066,8 @@ foreach ($user in $users) {
                 default { '?' }
             }
         }
-        foreach ($pid in $policyIdsOrdered) {
-            $row[$policyIdToName[$pid]] = if ($appliedPolicyStates.ContainsKey($pid)) { $appliedPolicyStates[$pid] } else { '0' }
+        foreach ($PolicyId in $policyIdsOrdered) {
+            $row[$policyIdToName[$PolicyId]] = if ($appliedPolicyStates.ContainsKey($PolicyId)) { $appliedPolicyStates[$PolicyId] } else { '0' }
         }
         $matrixRows.Add([PSCustomObject]$row)
     }
@@ -1176,7 +1176,7 @@ Write-Host "  Main Report: $OutputPath" -ForegroundColor Green
 if ($EmitMatrix) {
     Write-Host "  Matrix Report: $([System.IO.Path]::ChangeExtension($OutputPath, $null))_MATRIX.csv" -ForegroundColor Green
 }
-A
+
 Write-Host "=====================================" -ForegroundColor Green
 Write-Host "Enhanced CA Policy Coverage Audit Complete!" -ForegroundColor Green
 
